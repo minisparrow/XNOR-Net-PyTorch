@@ -12,6 +12,7 @@ from torchvision import datasets, transforms
 from torch.autograd import Variable
 
 import util
+import numpy as np
 
 def save_state(model, acc):
     print('==> Saving model ...')
@@ -25,70 +26,66 @@ def save_state(model, acc):
                     state['state_dict'].pop(key)
     torch.save(state, 'models/'+args.arch+'.best.pth.tar')
 
-def train(epoch):
-    model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        data, target = Variable(data), Variable(target)
-        optimizer.zero_grad()
 
-        # process the weights including binarization
-        bin_op.binarization()
+input_feature = {}
+output_feature = {}
+inter_gradient = {}
 
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
+def make_hook(name, flag):
+    if flag == 'forward':
+       def hook(m, input, output):
+          input_feature[name] = input
+          output_feature[name] = output  
+       return hook
+    elif flag == 'backward':
+       def hook(m, input, output):
+          inter_gradient[name] = output
+       return hook
+    else:
+       assert False
 
-        # restore weights
-        bin_op.restore()
-        bin_op.updateBinaryGradWeight()
-
-        optimizer.step()
-        if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.data.item()))
-    return
+#    m.register_forward_hook(make_hook(name, 'forward'))
+#    m.register_backward_hook(make_hook(name, 'backward'))
 
 def test(evaluate=False):
     global best_acc
     model.eval()
     test_loss = 0
     correct = 0
+    cnt = 0
 
-    bin_op.binarization()
     for data, target in test_loader:
+        cnt += 1
         if args.cuda:
             data, target = data.cuda(), target.cuda()
         data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
-        test_loss += criterion(output, target).data.item()
+  
+        model.conv_1.register_forward_hook(make_hook('conv_1', 'forward'))
+        model.conv_2.register_forward_hook(make_hook('conv_2', 'forward'))
+        model.fc_1.register_forward_hook(make_hook('fc_1', 'forward'))
+        model.fc_2.register_forward_hook(make_hook('fc_2', 'forward'))
+        model.fc_3.register_forward_hook(make_hook('fc_3', 'forward'))
+
+        for key,value in input_feature.items():
+            print(key)
+            np.savetxt('inner_features/'+key+'_input', value[0].cpu().detach().numpy().reshape(-1,1), fmt='%10f')
+
+        for key,value in output_feature.items():
+            print(key)
+            np.savetxt('inner_features/'+key+'_output', value[0].cpu().detach().numpy().reshape(-1,1), fmt='%10f')
+
         pred = output.data.max(1, keepdim=True)[1]
         correct += pred.eq(target.data.view_as(pred)).cpu().sum()
 
-    bin_op.restore()
-    
-    acc = 100. * float(correct) / len(test_loader.dataset)
-    if (acc > best_acc):
-        best_acc = acc
-        if not evaluate:
-            save_state(model, best_acc)
+        if cnt == 2:
+            break
 
-    test_loss /= len(test_loader.dataset)
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
         test_loss * args.batch_size, correct, len(test_loader.dataset),
         100. * float(correct) / len(test_loader.dataset)))
-    print('Best Accuracy: {:.2f}%\n'.format(best_acc))
-    return
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 15 epochs"""
-    lr = args.lr * (0.1 ** (epoch // args.lr_epochs))
-    print('Learning rate:', lr)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
+    return
 
 if __name__=='__main__':
     # Training settings
@@ -130,19 +127,12 @@ if __name__=='__main__':
     
     # load data
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
-    train_loader = torch.utils.data.DataLoader(
-            datasets.MNIST('data', train=True, download=True,
-                transform=transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize((0.1307,), (0.3081,))
-                    ])),
-                batch_size=args.batch_size, shuffle=True, **kwargs)
     test_loader = torch.utils.data.DataLoader(
             datasets.MNIST('data', train=False, transform=transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,))
                 ])),
-            batch_size=args.test_batch_size, shuffle=True, **kwargs)
+            batch_size=args.test_batch_size, shuffle=False, **kwargs)
     
     # generate the model
     if args.arch == 'LeNet_5':
@@ -151,12 +141,8 @@ if __name__=='__main__':
         print('ERROR: specified arch is not suppported')
         exit()
 
-    if not args.pretrained:
-        best_acc = 0.0
-    else:
-        pretrained_model = torch.load(args.pretrained)
-        best_acc = pretrained_model['acc']
-        model.load_state_dict(pretrained_model['state_dict'])
+    pretrained_model = torch.load('./models/LeNet_5.best.pth.tar')
+    model.load_state_dict(pretrained_model['state_dict'])
 
     if args.cuda:
         model.cuda()
@@ -165,32 +151,16 @@ if __name__=='__main__':
     param_dict = dict(model.named_parameters())
     params = []
     
-    base_lr = 0.1
-    
     for key, value in param_dict.items():
         params += [{'params':[value], 'lr': args.lr,
             'weight_decay': args.weight_decay,
             'key':key}]
     
-    optimizer = optim.Adam(params, lr=args.lr,
-            weight_decay=args.weight_decay)
+    test()
 
-    criterion = nn.CrossEntropyLoss()
-
-    # define the binarization operator
-    bin_op = util.BinOp(model)
-
-    if args.evaluate:
-        test(evaluate=True)
-        exit()
-
-    for epoch in range(1, args.epochs + 1):
-        adjust_learning_rate(optimizer, epoch)
-        train(epoch)
-        test()
-
-    params=dict(models.named_parameters())
-    for key,value in params.items():
+    param_dict = dict(model.named_parameters())
+    for key,value in param_dict.items():
         print(key)
         print(value.shape)
-        np.savetxt(key,value.detach().numpy().reshape(-1,1),fmt="%10f")
+        np.savetxt("weights/"+key,value.detach().cpu().numpy().reshape(-1,1),fmt="%10f")
+
